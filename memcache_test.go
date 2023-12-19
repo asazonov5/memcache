@@ -51,6 +51,7 @@ func newLocalhostServer(tb testing.TB) *Client {
 	if err != nil {
 		tb.Fatal(err)
 	}
+
 	return client
 }
 
