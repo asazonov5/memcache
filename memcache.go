@@ -21,10 +21,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -112,6 +114,12 @@ const (
 	cmdFlushQ
 	cmdAppendQ
 	cmdPrependQ
+)
+
+const (
+	opAuthList = iota + 0x20
+	opAuthStart
+	opAuthStep
 )
 
 type response uint16
@@ -225,18 +233,24 @@ func NewFromServers(servers Servers) *Client {
 // Client is a memcache client.
 // It is safe for unlocked use by multiple concurrent goroutines.
 type Client struct {
-	timeout        time.Duration
-	maxIdlePerAddr int
-	servers        Servers
-	mu             sync.RWMutex
-	freeconn       map[string]chan *conn
-	bufPool        chan []byte
+	timeout         time.Duration
+	maxIdlePerAddr  int
+	servers         Servers
+	mu              sync.RWMutex
+	freeconn        map[string]chan *conn
+	bufPool         chan []byte
+	Login, Password string
 }
 
 // Timeout returns the socket read/write timeout. By default, it's
 // DefaultTimeout.
 func (c *Client) Timeout() time.Duration {
 	return c.timeout
+}
+
+func (c *Client) SetAuthCredentials(login, password string) {
+	c.Login = login
+	c.Password = password
 }
 
 // SetTimeout specifies the socket read/write timeout.
@@ -413,6 +427,40 @@ func (cte *ConnectTimeoutError) Temporary() bool {
 	return true
 }
 
+//func (c *Client) Get(key string) (*Item, error) {
+//	cn, err := c.sendCommand(key, cmdGet, nil, 0, nil)
+//	if err != nil {
+//		return nil, err
+//	}
+//	return c.parseItemResponse(key, cn, true)
+//}
+
+func (c *Client) auth(conn *conn, login, password string) error {
+	err := c.sendConnCommand(conn, "", opAuthList, []byte{}, 0, []byte{})
+	if err != nil {
+		return err
+	}
+	item, err := c.parseItemResponse("", conn, false)
+	if err != nil {
+		return err
+	}
+	if strings.Index(string(item.Value), "PLAIN") != -1 {
+		err = c.sendConnCommand(conn, "PLAIN", opAuthStart, []byte(fmt.Sprintf("\x00%s\x00%s", login, password)), 0, []byte{})
+		if err != nil {
+			return err
+		}
+		item, err := c.parseItemResponse("", conn, false)
+		if err != nil {
+			return err
+		}
+		if strings.Index(string(item.Value), "Authenticated") == -1 {
+			return errors.New("wrong credentials")
+		}
+		return nil
+	}
+	return errors.New("unsupported auth type")
+}
+
 func (c *Client) dial(addr *Addr) (net.Conn, error) {
 	if c.timeout > 0 {
 		conn, err := net.DialTimeout(addr.n, addr.s, c.timeout)
@@ -437,6 +485,12 @@ func (c *Client) getConn(addr *Addr) (*conn, error) {
 		cn = &conn{
 			nc:   nc,
 			addr: addr,
+		}
+		if c.Login != "" && c.Password != "" {
+			err = c.auth(cn, c.Login, c.Password)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	if c.timeout > 0 {
